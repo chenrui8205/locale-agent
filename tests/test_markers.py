@@ -16,3 +16,14 @@ def test_plain_brackets_preserved() -> None:
     # Only P#/E# index groups are stripped — ordinary brackets stay.
     s = "Open Mon–Fri [by appointment]."
     assert _INDEX_MARKER.sub("", s) == s
+
+
+def test_httpx_request_lines_are_silenced() -> None:
+    """Apify is called with `?token=…` in the URL; httpx's INFO request line must not log it."""
+    import logging
+
+    from locale_agent.logging import configure_logging
+
+    configure_logging("INFO")
+    assert logging.getLogger("httpx").level >= logging.WARNING
+    assert logging.getLogger("httpcore").level >= logging.WARNING
