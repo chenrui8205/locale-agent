@@ -1,5 +1,9 @@
 """The LangGraph StateGraph: extract_intent → resolve_geo → plan → execute_tools
-→ resolve_entities → synthesize.
+→ resolve_entities → replan → execute_follow_ups → synthesize.
+
+`replan` + `execute_follow_ups` are the dependent second hop: once places are
+known, ask a free-text follow-up about each ("what do locals say about X") —
+bounded to one hop and `settings.replan_max_follow_ups` queries.
 
 Every node degrades gracefully: partial failures append to `notes` and never
 raise out of the graph. Grounding is enforced in `synthesize` (every factual
@@ -17,6 +21,7 @@ import h3
 from langgraph.graph import END, START, StateGraph
 
 from ..adapters import adapters_for, all_adapters
+from ..adapters.base import IMPLEMENTED_TIERS
 from ..config import get_settings
 from ..geocode import geocode
 from ..llm import get_llm
@@ -26,10 +31,12 @@ from ..schemas import (
     Answer,
     Citation,
     ExecutionPlan,
+    FollowUp,
     GeoContext,
     PlannedSource,
     QueryArchetype,
     QuerySpec,
+    ReplanDecision,
     ResolvedEntity,
     SourceResult,
 )
@@ -61,6 +68,12 @@ _CATEGORIES_BY_ARCHETYPE: dict[QueryArchetype, list[str]] = {
 
 _MAX_EVIDENCE = 10
 
+# Second hop: adapter the no-LLM fallback follows up on (the only adapter that can
+# answer "what do locals say about <place>"), and how many opinion titles the
+# template answer lists per place.
+_FALLBACK_FOLLOW_UP_ADAPTER = "reddit"
+_MAX_OPINIONS_IN_TEMPLATE = 2
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -81,6 +94,10 @@ def _budget(state: AgentState) -> RateBudget:
 
 def _notes(state: AgentState) -> list[str]:
     return list(state.get("notes", []))
+
+
+def _budget_remaining(budget: RateBudget) -> int:
+    return budget.cost_cap - budget.calls_made
 
 
 # --------------------------------------------------------------------------- #
@@ -414,6 +431,270 @@ async def resolve_entities(state: AgentState) -> AgentState:
 
 
 # --------------------------------------------------------------------------- #
+# 5b. replan (dependent second hop: which places, what to ask, whether to stop)
+# --------------------------------------------------------------------------- #
+_REPLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "follow_ups": {
+            "type": "array",
+            "description": "Follow-up queries to run, one per place, most useful first.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "entity_index": {
+                        "type": "integer",
+                        "description": "Index [P#] of the place this follow-up is about.",
+                    },
+                    "adapter": {
+                        "type": "string",
+                        "description": "Which source to ask (one of the ADAPTERS listed).",
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Short free-text search query, e.g. '<place name> <city> reviews'.",
+                    },
+                    "reason": {"type": "string"},
+                },
+                "required": ["entity_index", "adapter", "query", "reason"],
+            },
+        },
+        "stop": {
+            "type": "boolean",
+            "description": "True if no follow-up is worth its cost (then follow_ups is empty).",
+        },
+        "stop_reason": {
+            "type": "string",
+            "description": "Why you stopped (empty if you planned follow-ups).",
+        },
+    },
+    "required": ["follow_ups", "stop", "stop_reason"],
+}
+
+_REPLAN_SYSTEM = (
+    "You are the planner for Locale, a hyperlocal research assistant. A first search "
+    "already found the PLACES below for the user's question. Decide the second hop: "
+    "which places deserve a follow-up search for what locals say about them, and what "
+    "to ask. Pick at most MAX places — prefer the ones most likely to be recommended "
+    "(nearest, best matching the question) and skip generic or irrelevant ones. Each "
+    "query is a short free-text search (the place name, plus the city, plus what the "
+    "user cares about, e.g. 'Adobe Animal Hospital San Jose emergency reviews'). Only use "
+    "the ADAPTERS listed. If no follow-up is worth its cost (e.g. the places are all "
+    "chains the user won't need opinions on, or there is nothing to rank), set stop=true "
+    "with a one-line stop_reason."
+)
+
+
+def _follow_up_adapters() -> dict[str, Any]:
+    """Adapters that may be chosen for a follow-up: registered AND implemented-tier."""
+    return {a.name: a for a in all_adapters() if a.access_tier in IMPLEMENTED_TIERS}
+
+
+def _nearest(entities: list[ResolvedEntity], n: int) -> list[int]:
+    def _dist(i: int) -> float:
+        d = entities[i].distance_m
+        return d if d is not None else 1e18
+
+    return sorted(range(len(entities)), key=_dist)[:n]
+
+
+def _fallback_follow_ups(
+    entities: list[ResolvedEntity], geo: GeoContext | None, max_n: int
+) -> list[FollowUp]:
+    city = geo.city if geo else ""
+    return [
+        FollowUp(
+            entity_index=i,
+            adapter=_FALLBACK_FOLLOW_UP_ADAPTER,
+            query=f"{entities[i].name} {city}".strip(),
+            reason="nearest place (no LLM — deterministic fallback)",
+        )
+        for i in _nearest(entities, max_n)
+    ]
+
+
+def _validate_follow_ups(
+    raw: list[FollowUp],
+    entities: list[ResolvedEntity],
+    allowed: dict[str, Any],
+    max_n: int,
+    notes: list[str],
+) -> list[FollowUp]:
+    """Drop invalid indices/adapters/empty queries (each with a note), dedup by
+    (entity, adapter), and cap at max_n."""
+    out: list[FollowUp] = []
+    seen: set[tuple[int, str]] = set()
+    for fu in raw:
+        if not 0 <= fu.entity_index < len(entities):
+            notes.append(f"replan: dropped follow-up with invalid place index {fu.entity_index}")
+            continue
+        if fu.adapter not in allowed:
+            notes.append(f"replan: dropped follow-up on unknown/unsupported adapter '{fu.adapter}'")
+            continue
+        if not fu.query.strip():
+            notes.append(f"replan: dropped follow-up with empty query for '{entities[fu.entity_index].name}'")
+            continue
+        key = (fu.entity_index, fu.adapter)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(fu)
+        if len(out) >= max_n:
+            break
+    return out
+
+
+async def _llm_follow_ups(
+    state: AgentState,
+    entities: list[ResolvedEntity],
+    allowed: dict[str, Any],
+    max_n: int,
+) -> tuple[list[FollowUp], str]:
+    """Ask the model for follow-ups. Returns (follow_ups, stop_reason); raises on LLM error."""
+    settings = get_settings()
+    geo = state.get("geo")
+    where = geo.city if geo and geo.city else state.get("address", "")
+    adapters_txt = ", ".join(sorted(allowed))
+    data = await get_llm().extract(
+        model=settings.replan_model,
+        system=_REPLAN_SYSTEM,
+        user=(
+            f"Question: {state.get('raw_query', '')}\n"
+            f"User address: {state.get('address', '')} ({where})\n"
+            f"MAX: {max_n}\n"
+            f"ADAPTERS: {adapters_txt}\n\n"
+            "PLACES (cite as [P#]):\n" + _candidate_text(entities)
+        ),
+        tool_name="emit_replan",
+        tool_description="Emit the second-hop follow-up plan (or stop).",
+        input_schema=_REPLAN_SCHEMA,
+        max_tokens=600,
+    )
+    follow_ups: list[FollowUp] = []
+    for item in data.get("follow_ups") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            follow_ups.append(
+                FollowUp(
+                    entity_index=int(item.get("entity_index", -1)),
+                    adapter=str(item.get("adapter", "")).strip().lower(),
+                    query=str(item.get("query", "")).strip(),
+                    reason=str(item.get("reason", "")).strip(),
+                )
+            )
+        except (TypeError, ValueError):
+            continue
+    stop_reason = str(data.get("stop_reason") or "").strip()
+    if data.get("stop") or not follow_ups:
+        return [], stop_reason or "model chose to stop"
+    return follow_ups, ""
+
+
+async def replan(state: AgentState) -> AgentState:
+    settings = get_settings()
+    llm = get_llm()
+    entities = state.get("entities", [])
+    notes = _notes(state)
+    budget = _budget(state)
+    max_n = settings.replan_max_follow_ups
+
+    def _skip(reason: str) -> AgentState:
+        notes.append(f"replan: skipped — {reason}")
+        return {"replan": ReplanDecision(stop_reason=reason), "notes": notes}
+
+    if not settings.replan_enabled:
+        return _skip("disabled by config")
+    if not entities:
+        return _skip("no places to follow up on")
+    if _budget_remaining(budget) < 1:
+        return _skip("budget exhausted")
+    if max_n < 1:
+        return _skip("replan_max_follow_ups is 0")
+
+    allowed = _follow_up_adapters()
+    candidates = entities[:_MAX_OPTIONS]  # same window the synthesizer will see
+    via = "fallback"
+    stop_reason = ""
+    raw: list[FollowUp] = []
+    if llm.enabled:
+        try:
+            raw, stop_reason = await _llm_follow_ups(state, candidates, allowed, max_n)
+            via = "llm"
+        except Exception as e:  # noqa: BLE001
+            log.warning("replan.fallback", error=str(e))
+            notes.append(f"replan: LLM planning failed ({e}); used fallback")
+            raw, stop_reason, via = [], "", "fallback"
+    if via == "fallback":
+        raw = _fallback_follow_ups(candidates, state.get("geo"), max_n)
+
+    if via == "llm" and stop_reason and not raw:
+        return _skip(stop_reason)
+
+    follow_ups = _validate_follow_ups(raw, candidates, allowed, max_n, notes)
+    if not follow_ups:
+        return _skip("no valid follow-ups (no follow-up capable adapter?)")
+
+    notes.append(f"replan: {len(follow_ups)} follow-up(s) planned via {via}")
+    return {"replan": ReplanDecision(follow_ups=follow_ups), "notes": notes}
+
+
+# --------------------------------------------------------------------------- #
+# 5c. execute_follow_ups (parallel second hop; attaches opinions per place)
+# --------------------------------------------------------------------------- #
+async def execute_follow_ups(state: AgentState) -> AgentState:
+    decision = state.get("replan")
+    entities = list(state.get("entities", []))
+    context = list(state.get("context", []))
+    geo = state.get("geo")
+    notes = _notes(state)
+    budget = _budget(state)
+
+    if decision is None or not decision.follow_ups or geo is None:
+        if decision is not None and decision.follow_ups and geo is None:
+            notes.append("follow-ups: skipped — no geo context")
+        return {"entities": entities, "context": context, "notes": notes}
+
+    async def _run(fu: FollowUp) -> tuple[FollowUp, list[SourceResult] | Exception]:
+        adapter = _adapter_by_name(fu.adapter)
+        if adapter is None:
+            return fu, RuntimeError("adapter not found")
+        try:
+            res = await asyncio.wait_for(
+                adapter.search_text(fu.query, geo, budget), timeout=PER_CALL_TIMEOUT_S
+            )
+            return fu, list(res)
+        except Exception as e:  # noqa: BLE001 — isolate failures per follow-up
+            return fu, e
+
+    before = len(budget.notes)
+    outcomes = await asyncio.gather(*(_run(fu) for fu in decision.follow_ups))
+
+    seen_urls: set[str] = {r.url or r.title for r in context}
+    for fu, outcome in outcomes:
+        if isinstance(outcome, Exception):
+            notes.append(f"follow-up '{fu.query}' on {fu.adapter} failed: {outcome}")
+            continue
+        if not 0 <= fu.entity_index < len(entities):
+            notes.append(f"follow-up '{fu.query}': place index {fu.entity_index} out of range")
+            continue
+        entity = entities[fu.entity_index]
+        for r in outcome:
+            r.about = entity.name
+            entity.opinions.append(
+                Citation(source=r.source, url=r.url, snippet=f"{r.title} — {r.snippet}"[:300])
+            )
+            key = r.url or r.title
+            if key not in seen_urls:
+                seen_urls.add(key)
+                context.append(r)
+        notes.append(f"follow-up '{fu.query}' on {fu.adapter}: {len(outcome)} result(s)")
+
+    notes.extend(budget.notes[before:])  # only the notes this hop produced
+    return {"entities": entities, "context": context, "notes": notes}
+
+
+# --------------------------------------------------------------------------- #
 # 6. synthesize (grounded, cited)
 # --------------------------------------------------------------------------- #
 _SYNTH_SCHEMA: dict[str, Any] = {
@@ -448,13 +729,16 @@ _SYNTH_SYSTEM = (
     "Reference places and sources by NAME in your prose — do NOT print bracket indices "
     "like [P0] or [E1] in the answer text; instead report the indices you used in the "
     "cited_places and cited_evidence fields. Do NOT claim a place is 'open now' — hours "
-    "may be stale; tell the user to call ahead. If sources disagree, say so. Be concise "
-    "and practical."
+    "may be stale; tell the user to call ahead. If sources disagree, say so. "
+    "When a PLACE has indented '·' lines beneath it, those are what locals say about "
+    "THAT specific place — use them to rank and to justify each recommendation. Be "
+    "concise and practical."
 )
 
 _MAX_OPTIONS = 8
 
 _EVIDENCE_TAG = {"discussion": "Reddit", "article": "Local news", "context": "Wikipedia"}
+_SOURCE_TAG = {"reddit": "Reddit", "gdelt_news": "Local news", "wikipedia": "Wikipedia"}
 
 # Strip internal citation markers ([P0], [E1, E2], …) if the model leaks them into prose.
 _INDEX_MARKER = re.compile(r"\s?\[[PE]\d+(?:\s*,\s*[PE]?\d+)*\]")
@@ -473,6 +757,8 @@ def _candidate_text(cands: list[ResolvedEntity]) -> str:
             extras.append(f"listed hours {c.attributes['opening_hours']}")
         extra = f" | {'; '.join(extras)}" if extras else ""
         lines.append(f"[P{i}] {c.name} — {c.attributes.get('snippet', '')} ({dist}){extra}")
+        for op in c.opinions:
+            lines.append(f"   · ({_SOURCE_TAG.get(op.source, op.source)}) {op.snippet}")
     return "\n".join(lines)
 
 
@@ -566,6 +852,9 @@ async def synthesize(state: AgentState) -> AgentState:
                 contact = c.attributes.get("phone") or c.attributes.get("website") or ""
                 contact = f" — {contact}" if contact else ""
                 lines.append(f"{i + 1}. {c.name} ({dist}){contact}")
+                for op in c.opinions[:_MAX_OPINIONS_IN_TEMPLATE]:
+                    title = op.snippet.split(" — ", 1)[0]
+                    lines.append(f"   · What locals say: {title}")
             lines.append("Call ahead to confirm hours and availability.")
             cited_p = list(range(min(5, len(cands))))
         if evidence:
@@ -602,6 +891,8 @@ def build_graph():  # type: ignore[no-untyped-def]
     g.add_node("plan", plan)
     g.add_node("execute_tools", execute_tools)
     g.add_node("resolve_entities", resolve_entities)
+    g.add_node("replan", replan)
+    g.add_node("execute_follow_ups", execute_follow_ups)
     g.add_node("synthesize", synthesize)
 
     g.add_edge(START, "extract_intent")
@@ -609,7 +900,9 @@ def build_graph():  # type: ignore[no-untyped-def]
     g.add_edge("resolve_geo", "plan")
     g.add_edge("plan", "execute_tools")
     g.add_edge("execute_tools", "resolve_entities")
-    g.add_edge("resolve_entities", "synthesize")
+    g.add_edge("resolve_entities", "replan")
+    g.add_edge("replan", "execute_follow_ups")
+    g.add_edge("execute_follow_ups", "synthesize")
     g.add_edge("synthesize", END)
     return g.compile()
 

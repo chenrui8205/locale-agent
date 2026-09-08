@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # Guardrails
     cost_cap_external_calls: int = 12
 
+    # Re-planning (second hop): after places are resolved, plan up to N free-text
+    # follow-up queries ("what do locals say about <place>"). One hop only; the
+    # follow-ups are charged against cost_cap_external_calls.
+    replan_enabled: bool = True
+    replan_max_follow_ups: int = 3
+    replan_model: str = "claude-haiku-4-5"
+
     # Logging
     log_level: str = "INFO"
 

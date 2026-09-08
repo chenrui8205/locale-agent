@@ -10,6 +10,7 @@ from ..schemas import (
     GeoContext,
     ProposedAction,
     QuerySpec,
+    ReplanDecision,
     ResolvedEntity,
     SourceResult,
 )
@@ -25,6 +26,7 @@ class AgentState(TypedDict, total=False):
     results: list[SourceResult]
     entities: list[ResolvedEntity]
     context: list[SourceResult]  # non-place evidence (Reddit/news/wiki) for synthesis
+    replan: ReplanDecision | None  # second-hop follow-up decision (None before `replan` runs)
     answer: Answer | None
     actions: list[ProposedAction]
     notes: list[str]
