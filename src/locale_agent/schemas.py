@@ -70,6 +70,7 @@ class SourceResult(BaseModel):
     geo: tuple[float, float] | None = None  # (lat, lng)
     fetched_at: datetime
     raw: dict = Field(default_factory=dict)  # EPHEMERAL — never written to the DB
+    about: str | None = None  # entity name this result is about (None for first-hop results)
 
 
 # --------------------------------------------------------------------------- #
@@ -84,6 +85,24 @@ class PlannedSource(BaseModel):
 class ExecutionPlan(BaseModel):
     sources: list[PlannedSource] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
+
+
+class FollowUp(BaseModel):
+    """One second-hop query whose argument depends on a first-hop result
+    (e.g. 'what do locals say about <place>')."""
+
+    entity_index: int  # index into state["entities"]
+    adapter: str  # adapter name, e.g. "reddit"
+    query: str  # free text sent to adapter.search_text
+    reason: str = ""
+
+
+class ReplanDecision(BaseModel):
+    """Output of the `replan` node: bounded to one hop, at most
+    `settings.replan_max_follow_ups` follow-ups."""
+
+    follow_ups: list[FollowUp] = Field(default_factory=list)
+    stop_reason: str = ""  # non-empty when no follow-ups were planned
 
 
 # --------------------------------------------------------------------------- #
@@ -107,6 +126,7 @@ class ResolvedEntity(BaseModel):
     distance_m: float | None = None
     attributes: dict = Field(default_factory=dict)  # phone, website, opening_hours, ...
     sources: list[Citation] = Field(default_factory=list)
+    opinions: list[Citation] = Field(default_factory=list)  # per-place evidence (follow-up hop)
 
 
 class Answer(BaseModel):

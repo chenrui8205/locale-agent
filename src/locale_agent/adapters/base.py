@@ -37,6 +37,18 @@ class SourceAdapter(ABC):
     ) -> list[SourceResult]:
         ...
 
+    async def search_text(
+        self, query: str, geo: GeoContext, budget: RateBudget
+    ) -> list[SourceResult]:
+        """Free-text follow-up query (second hop), e.g. "<place name> <city>".
+
+        Default: not supported — records a budget note and returns []. Adapters
+        that can answer free text (Reddit, Wikipedia) override this. Like
+        `search`, implementations degrade to [] + note and never raise.
+        """
+        budget.note(f"{self.name}: follow-up search not supported")
+        return []
+
 
 _REGISTRY: list[SourceAdapter] = []
 

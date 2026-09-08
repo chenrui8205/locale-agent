@@ -8,13 +8,14 @@ This is the **V0 MVP**: the deterministic `FIND_PLACE` spine, end-to-end.
 
 ```
 POST /ask  →  extract_intent → resolve_geo → plan → execute_tools
-              → resolve_entities → synthesize (grounded, cited)
+              → resolve_entities → replan → execute_follow_ups
+              → synthesize (grounded, cited)
 ```
 
 ## What's in V0
 
 - **FastAPI** service: `POST /ask`, `GET /healthz`, and a small web UI at `/`.
-- **LangGraph** agent spine with six nodes (above).
+- **LangGraph** agent spine with eight nodes (above).
 - **One real, keyless source**: OpenStreetMap — Nominatim (geocoding) + Overpass
   (place search). No API keys, no billing.
 - **Claude** for intent extraction (Haiku) and answer synthesis (Sonnet), with a
@@ -28,10 +29,52 @@ POST /ask  →  extract_intent → resolve_geo → plan → execute_tools
 Everything degrades gracefully: if Redis, Postgres, or the LLM key is missing, the
 request still returns a grounded answer and records a `note` — never a 5xx.
 
+### Second hop (re-planning)
+
+The first hop is a fixed workflow: archetype → source categories → one parallel
+fan-out. That cannot ask a question whose *arguments depend on first-hop results*
+("what do locals say about **Adobe Animal Hospital**?"). So after places are
+resolved the graph runs one bounded, dependent hop:
+
+- **`replan`** — Haiku sees the resolved places (`[P#]` lines) and makes exactly
+  three decisions via one forced tool call: *which* places deserve a follow-up,
+  *what* free-text query to ask about each, and *whether to stop*. Everything
+  else stays on rails: at most `replan_max_follow_ups` queries, only registered
+  adapters, invalid picks dropped with a note. With no key (or on any model error)
+  a deterministic fallback follows up on the nearest N places with
+  `"<place name> <city>"` on Reddit.
+- **`execute_follow_ups`** — runs the follow-ups in parallel through the new
+  `SourceAdapter.search_text(query, geo, budget)` method (Reddit via Apify as
+  `subreddit:<cityslug> <place>` over all time — the only query shape that
+  measured on-topic *local* hits; Wikipedia full-text; other adapters answer
+  "not supported" + `[]`). Results are
+  stamped `about=<place>`, attached to each place as `ResolvedEntity.opinions`
+  (citations), and also appended to `context` so nothing is lost. They are
+  charged against the same per-request `cost_cap_external_calls` budget.
+- **`synthesize`** sees the opinions inline under each place and is told to use
+  them when ranking; the template answer lists "What locals say: …" per place.
+
+It surfaces in the API as `AskResponse.replan` (`follow_ups[{entity_index,
+adapter, query, reason}]`, `stop_reason`) and `options[i].opinions`; the web UI
+renders a "What locals say" list under each place card and the second-hop plan
+in the agent notes. Every decision is also a note: `replan: 3 follow-up(s)
+planned via llm|fallback`, `replan: skipped — <reason>`, `follow-up '<query>' on
+<adapter>: <k> result(s)`.
+
+Config knobs (`.env` / `config.py`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `REPLAN_ENABLED` | `true` | Turn the second hop off entirely (`replan: skipped — disabled by config`). |
+| `REPLAN_MAX_FOLLOW_UPS` | `3` | Hard cap on follow-up queries per request (also the fallback's "nearest N"). |
+| `REPLAN_MODEL` | `claude-haiku-4-5` | Model for the `replan` decision. |
+
 > **Deferred (later milestones):** the async live `/feed` + Celery ingestion, the
-> other archetypes (service-pro, community, listings), more sources (Reddit, Yelp,
-> Nextdoor, FB/Thumbtack stubs), entity-embedding tie-break, multi-turn
-> checkpointing, and the eval harness.
+> other archetypes (service-pro, community, listings) — including a follow-up hop
+> for `FIND_SERVICE_PRO` when Overpass returns nothing — more sources (Yelp,
+> Nextdoor, FB/Thumbtack stubs), a title-overlap filter for Wikipedia follow-ups,
+> multi-hop re-planning (today it is exactly one hop), entity-embedding tie-break,
+> multi-turn checkpointing, and the eval harness.
 
 ## Prerequisites
 
@@ -89,13 +132,18 @@ uv run pytest        # offline tests (respx-mocked; no live network)
 uv run mypy src/locale_agent
 ```
 
+The suite is hermetic even when `.env` holds real keys: `tests/conftest.py`
+swaps the LLM client for a disabled stub and blanks `ANTHROPIC_API_KEY` /
+`APIFY_TOKEN` on the cached settings for every test. `tests/test_replan_e2e.py`
+drives the second hop end-to-end through the FastAPI app with a fake adapter.
+
 ## Layout
 
 ```
 src/locale_agent/
   api/main.py        FastAPI app (/ask, /healthz, /)
-  agent/graph.py     LangGraph nodes + StateGraph
-  adapters/          SourceAdapter ABC, registry, Overpass adapter
+  agent/graph.py     LangGraph nodes + StateGraph (incl. replan / execute_follow_ups)
+  adapters/          SourceAdapter ABC (search + search_text), registry, Overpass/Wikipedia/GDELT/Reddit
   geocode.py         Nominatim geocoding
   schemas.py         Pydantic domain models (QuerySpec, Answer, ...)
   models.py          SQLAlchemy ORM (place, query_log, signal, answer)

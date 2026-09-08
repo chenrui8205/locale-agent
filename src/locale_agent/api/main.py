@@ -18,7 +18,7 @@ from ..db import SessionLocal, engine
 from ..logging import bind_query_id, configure_logging, get_logger
 from ..persistence import persist_ask
 from ..ratelimit import RateBudget
-from ..schemas import Answer, GeoContext, QueryArchetype, QuerySpec, SourceResult
+from ..schemas import Answer, GeoContext, QueryArchetype, QuerySpec, ReplanDecision, SourceResult
 from ..agent import run_agent
 
 log = get_logger(__name__)
@@ -47,6 +47,9 @@ class AskResponse(BaseModel):
     spec: QuerySpec | None
     geo: GeoContext | None
     context: list[SourceResult] = Field(default_factory=list)
+    # Second hop: which places the agent followed up on (and why), or why it
+    # stopped. None only if the graph never reached the `replan` node.
+    replan: ReplanDecision | None = None
     notes: list[str]
 
 
@@ -147,6 +150,7 @@ async def ask(req: AskRequest) -> AskResponse:
         spec=state.get("spec"),
         geo=state.get("geo"),
         context=state.get("context", []),
+        replan=state.get("replan"),
         notes=notes,
     )
 
