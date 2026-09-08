@@ -9,6 +9,11 @@ gracefully (empty + note) when no APIFY_TOKEN is configured.
 Project decision: this routes around Reddit's official API via a commercial
 scraping vendor. Keep volume low and persist nothing — `SourceResult.raw` stays
 empty per the no-hoarding rule.
+
+Two entry points share one Apify call path:
+  - `search(spec, geo, budget)`: first hop, query built from the QuerySpec.
+  - `search_text(query, geo, budget)`: second hop (re-planning), free text such
+    as "<place name>" — the city is prefixed here so the caller doesn't have to.
 """
 
 from __future__ import annotations
@@ -24,7 +29,8 @@ from .base import AccessTier, SourceAdapter, register
 
 log = get_logger(__name__)
 
-_LIMIT = 8
+_LIMIT = 8           # first-hop posts per query
+_FOLLOWUP_LIMIT = 5  # second-hop posts per follow-up query (bounded fan-out)
 
 
 def _city_slug(city: str) -> str:
@@ -77,6 +83,21 @@ class RedditAdapter(SourceAdapter):
     async def search(
         self, spec: QuerySpec, geo: GeoContext, budget: RateBudget
     ) -> list[SourceResult]:
+        return await self._run(_search_terms(spec), geo, budget, limit=_LIMIT, hop="search")
+
+    async def search_text(
+        self, query: str, geo: GeoContext, budget: RateBudget
+    ) -> list[SourceResult]:
+        """Second hop: free-text query (e.g. a place name) prefixed with the city.
+
+        Same actor and run_input shape as `search`, capped at `_FOLLOWUP_LIMIT`.
+        `about` is left unset — the caller stamps the entity it asked about.
+        """
+        return await self._run(query.strip(), geo, budget, limit=_FOLLOWUP_LIMIT, hop="search_text")
+
+    async def _run(
+        self, terms: str, geo: GeoContext, budget: RateBudget, *, limit: int, hop: str
+    ) -> list[SourceResult]:
         settings = get_settings()
         if not settings.has_apify:
             budget.note("reddit: no APIFY_TOKEN configured; skipped")
@@ -84,7 +105,6 @@ class RedditAdapter(SourceAdapter):
         if not await budget.allow(self.name):
             return []
 
-        terms = _search_terms(spec)
         query = f"{geo.city} {terms}".strip() if geo.city else terms
         run_input = {
             "searches": [query],
@@ -94,7 +114,7 @@ class RedditAdapter(SourceAdapter):
             "searchUsers": False,
             "sort": "relevance",
             "time": "year",
-            "maxItems": _LIMIT,
+            "maxItems": limit,
         }
         now = datetime.now(UTC)
         try:
@@ -107,7 +127,11 @@ class RedditAdapter(SourceAdapter):
             )
         except ApifyError as e:
             budget.note(f"reddit (apify): {e}")
-            log.warning("reddit.apify_error", error=str(e))
+            log.warning("reddit.apify_error", hop=hop, error=str(e))
+            return []
+        except Exception as e:  # noqa: BLE001 — adapters never raise into the graph
+            budget.note(f"reddit (apify): unexpected error: {e}")
+            log.warning("reddit.unexpected_error", hop=hop, error=str(e))
             return []
 
         results: list[SourceResult] = []
@@ -118,7 +142,7 @@ class RedditAdapter(SourceAdapter):
                 continue
             seen.add(str(r.url))
             results.append(r)
-        log.info("reddit.search", query=query, results=len(results))
+        log.info(f"reddit.{hop}", query=query, results=len(results))
         return results
 
 
