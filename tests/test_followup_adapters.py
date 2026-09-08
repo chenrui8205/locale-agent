@@ -1,6 +1,7 @@
 """Second-hop `search_text` on adapters — offline (respx-mocked), no keys.
 
-Covers the re-planning contract: Reddit prefixes the city and caps at 5 items,
+Covers the re-planning contract: Reddit scopes to the city's subreddit over all
+time (the only query shape that measured relevant + local hits) and caps at 5 items,
 Wikipedia does a full-text MediaWiki search, both degrade to [] + a budget note
 instead of raising, and the base class refuses politely.
 """
@@ -13,7 +14,7 @@ import httpx
 import respx
 
 from locale_agent.adapters.base import AccessTier, SourceAdapter
-from locale_agent.adapters.reddit import _FOLLOWUP_LIMIT, RedditAdapter
+from locale_agent.adapters.reddit import _FOLLOWUP_LIMIT, RedditAdapter, _followup_query, _strip_city
 from locale_agent.adapters.wikipedia import WikipediaAdapter
 from locale_agent.config import Settings, get_settings
 from locale_agent.ratelimit import RateBudget
@@ -85,7 +86,7 @@ async def test_base_search_text_default_is_unsupported() -> None:
 # Reddit
 # --------------------------------------------------------------------------- #
 @respx.mock
-async def test_reddit_search_text_builds_city_query_and_followup_limit(monkeypatch) -> None:
+async def test_reddit_search_text_scopes_to_city_subreddit_and_followup_limit(monkeypatch) -> None:
     import locale_agent.adapters.reddit as rmod
 
     monkeypatch.setattr(
@@ -98,9 +99,10 @@ async def test_reddit_search_text_builds_city_query_and_followup_limit(monkeypat
 
     assert route.called and route.call_count == 1
     sent = json.loads(route.calls.last.request.content)
-    assert sent["searches"] == ["San Jose Adobe Animal Hospital"]
+    assert sent["searches"] == ["subreddit:sanjose Adobe Animal Hospital"]
     assert sent["maxItems"] == _FOLLOWUP_LIMIT == 5
-    assert sent["searchPosts"] is True and sent["sort"] == "relevance" and sent["time"] == "year"
+    assert sent["searchPosts"] is True and sent["searchComments"] is False
+    assert sent["sort"] == "relevance" and sent["time"] == "all"
     assert budget.calls_made == 1  # charged exactly once
 
     assert len(results) == 2  # no-url item dropped
@@ -121,14 +123,25 @@ async def test_reddit_search_text_without_city_sends_bare_query(monkeypatch) -> 
 
 
 @respx.mock
-async def test_reddit_search_text_does_not_double_prefix_city(monkeypatch) -> None:
+async def test_reddit_search_text_strips_city_from_query(monkeypatch) -> None:
     import locale_agent.adapters.reddit as rmod
 
     monkeypatch.setattr(rmod, "get_settings", lambda: Settings(apify_token="tok"))
     route = respx.post(url__startswith=_APIFY_ENDPOINT).mock(return_value=httpx.Response(200, json=[]))
+    # Both planner paths may name the city ("<name> <city>" fallback, LLM free text);
+    # the city is expressed exactly once, as the subreddit scope.
     await RedditAdapter().search_text(f"{_QUERY} san jose reviews", _GEO, RateBudget(None, cost_cap=12))
-    # city already present (case-insensitive) → sent as-is, not "San Jose Adobe ... san jose ..."
-    assert json.loads(route.calls.last.request.content)["searches"] == [f"{_QUERY} san jose reviews"]
+    assert json.loads(route.calls.last.request.content)["searches"] == [f"subreddit:sanjose {_QUERY} reviews"]
+
+
+def test_followup_query_shapes() -> None:
+    assert _strip_city("Banfield Pet Hospital San Jose", "San Jose") == "Banfield Pet Hospital"
+    assert _strip_city("San Jose Banfield San Jose emergency", "San Jose") == "Banfield emergency"
+    assert _strip_city("San Josefina Bakery", "San Jose") == "San Josefina Bakery"  # whole words only
+    assert _strip_city("  Philz Coffee ", None) == "Philz Coffee"
+    assert _followup_query("Philz Coffee", "San Jose") == "subreddit:sanjose Philz Coffee"
+    assert _followup_query("Philz Coffee", "Los Altos") == "subreddit:losaltos Philz Coffee"
+    assert _followup_query("Philz Coffee San Jose", None) == "Philz Coffee San Jose"
 
 
 async def test_reddit_search_text_noop_without_token(monkeypatch) -> None:

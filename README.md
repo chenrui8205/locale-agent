@@ -44,8 +44,10 @@ resolved the graph runs one bounded, dependent hop:
   a deterministic fallback follows up on the nearest N places with
   `"<place name> <city>"` on Reddit.
 - **`execute_follow_ups`** — runs the follow-ups in parallel through the new
-  `SourceAdapter.search_text(query, geo, budget)` method (Reddit via Apify,
-  Wikipedia full-text; other adapters answer "not supported" + `[]`). Results are
+  `SourceAdapter.search_text(query, geo, budget)` method (Reddit via Apify as
+  `subreddit:<cityslug> <place>` over all time — the only query shape that
+  measured on-topic *local* hits; Wikipedia full-text; other adapters answer
+  "not supported" + `[]`). Results are
   stamped `about=<place>`, attached to each place as `ResolvedEntity.opinions`
   (citations), and also appended to `context` so nothing is lost. They are
   charged against the same per-request `cost_cap_external_calls` budget.
