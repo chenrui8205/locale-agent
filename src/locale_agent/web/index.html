@@ -113,6 +113,13 @@
   .opt-links a { font-size: 13px; text-decoration: none; color: var(--accent-ink); background: #f3f4f6; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); }
   .opt-links a:hover { background: #eceefe; }
   .dist { flex: none; font-size: 12px; font-weight: 600; color: var(--good); background: #eaf7f0; padding: 4px 9px; border-radius: 999px; height: fit-content; }
+  .opt-opinions { margin-top: 10px; padding: 10px 12px; border-radius: 10px; background: #fafafc; border: 1px solid var(--line); }
+  .opt-opinions .oh { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em; color: var(--accent-ink); margin-bottom: 4px; }
+  .opt-opinions ul { list-style: none; margin: 0; padding: 0; }
+  .opt-opinions li { font-size: 13px; color: var(--muted); padding: 3px 0; }
+  .opt-opinions li a { color: var(--ink); text-decoration: none; font-weight: 500; }
+  .opt-opinions li a:hover { color: var(--accent-ink); text-decoration: underline; }
+  .opt-opinions li .oq { color: var(--muted); }
 
   .evi { padding: 14px 18px; border-bottom: 1px solid var(--line); }
   .evi:last-child { border-bottom: 0; }
@@ -125,6 +132,11 @@
   details summary { cursor: pointer; font-size: 13px; color: var(--muted); padding: 8px 0; }
   details summary:hover { color: var(--ink); }
   .cite, .note { font-size: 13px; color: var(--muted); padding: 6px 0; border-top: 1px dashed var(--line); }
+  .replan { font-size: 13px; color: var(--muted); padding: 8px 0 10px; }
+  .replan .rh { font-weight: 600; color: var(--ink); }
+  .replan ul { margin: 4px 0 0; padding-left: 18px; }
+  .replan li { padding: 2px 0; }
+  .replan code { background: #eceef2; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
   .cite a { color: var(--accent-ink); }
 
   .loading { display: none; align-items: center; gap: 10px; color: var(--muted); padding: 22px; font-size: 15px; margin-top: 20px; }
@@ -204,7 +216,8 @@
         <div id="cites"></div>
       </details>
       <details class="notes hidden" id="notesWrap">
-        <summary>Agent notes (routing, sources, dedup)</summary>
+        <summary>Agent notes (routing, sources, second hop, dedup)</summary>
+        <div id="replan" class="replan hidden"></div>
         <div id="notes"></div>
       </details>
     </div>
@@ -417,6 +430,36 @@ const EVI = {
   context:    { icon:"📖", title:"Area context",    tag:"Wikipedia" },
 };
 
+/* Second hop: per-place evidence from the follow-up search. Citation snippets
+   are "<title> — <snippet>"; the title becomes the link text. */
+function renderOpinions(opinions) {
+  const ops = opinions || [];
+  if (!ops.length) return "";
+  const items = ops.map(op => {
+    const parts = (op.snippet || "").split(" — ");
+    const title = parts.shift() || op.source || "source";
+    const rest = parts.join(" — ");
+    const t = op.url ? `<a href="${esc(op.url)}" target="_blank" rel="noopener">${esc(title)}</a>` : esc(title);
+    const tag = op.source ? `<span class="src-tag">${esc(op.source)}</span> ` : "";
+    return `<li>${tag}${t}${rest ? ` <span class="oq">— ${esc(rest)}</span>` : ""}</li>`;
+  }).join("");
+  return `<div class="opt-opinions"><div class="oh">💬 What locals say</div><ul>${items}</ul></div>`;
+}
+
+function renderReplan(rp) {
+  const el = $("replan"); el.innerHTML = "";
+  if (!rp) { el.classList.add("hidden"); return false; }
+  const fus = rp.follow_ups || [];
+  if (fus.length) {
+    const rows = fus.map(f => `<li><code>${esc(f.adapter)}</code> ${esc(f.query)}${f.reason ? ` <span class="oq">— ${esc(f.reason)}</span>` : ""}</li>`).join("");
+    el.innerHTML = `<div class="rh">Second hop: ${fus.length} follow-up search${fus.length === 1 ? "" : "es"} on what locals say</div><ul>${rows}</ul>`;
+  } else {
+    el.innerHTML = `<div class="rh">Second hop: skipped</div><div>${esc(rp.stop_reason || "no follow-ups planned")}</div>`;
+  }
+  el.classList.remove("hidden");
+  return true;
+}
+
 function render(data) {
   const ans = data.answer || { body:"No answer.", citations:[], confidence:0, options:[] };
   $("body").textContent = ans.body || "";
@@ -442,6 +485,7 @@ function render(data) {
             <div class="opt-name">${esc(o.name)}</div>
             <div class="opt-meta">${cat}</div>
             <div class="opt-links">${links.join("")}</div>
+            ${renderOpinions(o.opinions)}
           </div>
           ${km ? `<div class="dist">${km}</div>` : ""}
         </div>`);
@@ -479,10 +523,11 @@ function render(data) {
     $("citesWrap").classList.remove("hidden");
   } else { $("citesWrap").classList.add("hidden"); }
 
-  // notes
+  // notes (+ the second-hop decision, when the graph reached `replan`)
+  const hasReplan = renderReplan(data.replan);
   const notes = data.notes || [];
   const notesEl = $("notes"); notesEl.innerHTML = "";
-  if (notes.length) {
+  if (notes.length || hasReplan) {
     notes.forEach(n => notesEl.insertAdjacentHTML("beforeend", `<div class="note">${esc(n)}</div>`));
     $("notesWrap").classList.remove("hidden");
   } else { $("notesWrap").classList.add("hidden"); }
