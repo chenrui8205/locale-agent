@@ -74,6 +74,60 @@ _MAX_EVIDENCE = 10
 _FALLBACK_FOLLOW_UP_ADAPTER = "reddit"
 _MAX_OPINIONS_IN_TEMPLATE = 2
 
+# Relevance filter for follow-up results (see `_is_about`). A follow-up hit is kept
+# only if it plausibly mentions the place it was asked about; otherwise the second
+# hop degrades to city-level noise (World Cup threads under a vet's card). Words
+# that name a *kind* of place rather than a specific one carry no signal.
+_GENERIC_NAME_TOKENS: frozenset[str] = frozenset({
+    # stopwords / connectors
+    "the", "a", "an", "and", "or", "of", "at", "in", "on", "for", "by", "to", "with",
+    # place kinds / descriptors
+    "pet", "pets", "animal", "animals", "hospital", "hospitals", "center", "centre",
+    "centers", "clinic", "clinics", "medical", "veterinary", "vet", "vets", "emergency",
+    "urgent", "care", "health", "healthcare", "wellness", "doctor", "doctors", "dr", "dvm",
+    "office", "offices", "shop", "store", "stores", "market", "cafe", "restaurant", "bar",
+    "grill", "kitchen", "park", "school", "church", "services", "service", "group",
+    "associates", "specialists", "specialty", "family", "community", "general",
+    # corporate suffixes
+    "inc", "llc", "co", "corp", "ltd", "company",
+    # street / direction noise that shows up in OSM names
+    "north", "south", "east", "west", "n", "s", "e", "w", "st", "street", "ave",
+    "avenue", "rd", "road", "blvd", "boulevard", "drive", "hwy", "highway",
+})
+_MIN_GENERIC_TOKEN_MATCHES = 2  # names made only of generic words need this many hits
+
+_TOKEN_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokens(text: str) -> list[str]:
+    return _TOKEN_RE.findall(text.lower())
+
+
+def _is_about(result_text: str, entity_name: str, *, extra_generic: frozenset[str] = frozenset()) -> bool:
+    """Deterministic relevance rule for a follow-up hit.
+
+    Tokenise the entity name (lowercase, alnum), drop generic words (and any
+    caller-supplied ones, e.g. the city's tokens), and require at least one
+    distinctive token to appear as a whole word in `result_text`. A name with no
+    distinctive token (e.g. "Pet Emergency Center") must match at least
+    `_MIN_GENERIC_TOKEN_MATCHES` of its own tokens instead.
+    """
+    name_tokens = _tokens(entity_name)
+    if not name_tokens:
+        return False
+    text_tokens = set(_tokens(result_text))
+    generic = _GENERIC_NAME_TOKENS | extra_generic
+    distinctive = [t for t in name_tokens if t not in generic]
+    if distinctive:
+        return any(t in text_tokens for t in distinctive)
+    # Generic-only name: count matches of its own words, but never the caller's
+    # extra generics (the city) — those appear in every local post.
+    countable = {t for t in name_tokens if t not in extra_generic}
+    if not countable:
+        return False
+    hits = sum(1 for t in countable if t in text_tokens)
+    return hits >= min(_MIN_GENERIC_TOKEN_MATCHES, len(countable))
+
 
 # --------------------------------------------------------------------------- #
 # helpers
@@ -477,9 +531,10 @@ _REPLAN_SYSTEM = (
     "which places deserve a follow-up search for what locals say about them, and what "
     "to ask. Pick at most MAX places — prefer the ones most likely to be recommended "
     "(nearest, best matching the question) and skip generic or irrelevant ones. Each "
-    "query is a short free-text search (the place name, plus the city, plus what the "
-    "user cares about, e.g. 'Adobe Animal Hospital San Jose emergency reviews'). Only use "
-    "the ADAPTERS listed. If no follow-up is worth its cost (e.g. the places are all "
+    "query is SHORT: the place name plus one or two intent words, e.g. 'Adobe Animal "
+    "Hospital reviews' or 'Banfield emergency'. Do NOT include the city or state — the "
+    "search adapter adds the city itself, and long queries return unrelated city-wide "
+    "posts. Only use the ADAPTERS listed. If no follow-up is worth its cost (e.g. the places are all "
     "chains the user won't need opinions on, or there is nothing to rank), set stop=true "
     "with a one-line stop_reason."
 )
@@ -498,15 +553,13 @@ def _nearest(entities: list[ResolvedEntity], n: int) -> list[int]:
     return sorted(range(len(entities)), key=_dist)[:n]
 
 
-def _fallback_follow_ups(
-    entities: list[ResolvedEntity], geo: GeoContext | None, max_n: int
-) -> list[FollowUp]:
-    city = geo.city if geo else ""
+def _fallback_follow_ups(entities: list[ResolvedEntity], max_n: int) -> list[FollowUp]:
+    # Query is the bare place name: the follow-up adapter prefixes the city itself.
     return [
         FollowUp(
             entity_index=i,
             adapter=_FALLBACK_FOLLOW_UP_ADAPTER,
-            query=f"{entities[i].name} {city}".strip(),
+            query=entities[i].name.strip(),
             reason="nearest place (no LLM — deterministic fallback)",
         )
         for i in _nearest(entities, max_n)
@@ -626,7 +679,7 @@ async def replan(state: AgentState) -> AgentState:
             notes.append(f"replan: LLM planning failed ({e}); used fallback")
             raw, stop_reason, via = [], "", "fallback"
     if via == "fallback":
-        raw = _fallback_follow_ups(candidates, state.get("geo"), max_n)
+        raw = _fallback_follow_ups(candidates, max_n)
 
     if via == "llm" and stop_reason and not raw:
         return _skip(stop_reason)
@@ -671,6 +724,7 @@ async def execute_follow_ups(state: AgentState) -> AgentState:
     outcomes = await asyncio.gather(*(_run(fu) for fu in decision.follow_ups))
 
     seen_urls: set[str] = {r.url or r.title for r in context}
+    city_tokens = frozenset(_tokens(geo.city or ""))
     for fu, outcome in outcomes:
         if isinstance(outcome, Exception):
             notes.append(f"follow-up '{fu.query}' on {fu.adapter} failed: {outcome}")
@@ -679,7 +733,11 @@ async def execute_follow_ups(state: AgentState) -> AgentState:
             notes.append(f"follow-up '{fu.query}': place index {fu.entity_index} out of range")
             continue
         entity = entities[fu.entity_index]
-        for r in outcome:
+        relevant = [
+            r for r in outcome
+            if _is_about(f"{r.title} {r.snippet}", entity.name, extra_generic=city_tokens)
+        ]
+        for r in relevant:
             r.about = entity.name
             entity.opinions.append(
                 Citation(source=r.source, url=r.url, snippet=f"{r.title} — {r.snippet}"[:300])
@@ -688,7 +746,9 @@ async def execute_follow_ups(state: AgentState) -> AgentState:
             if key not in seen_urls:
                 seen_urls.add(key)
                 context.append(r)
-        notes.append(f"follow-up '{fu.query}' on {fu.adapter}: {len(outcome)} result(s)")
+        notes.append(
+            f"follow-up '{fu.query}' on {fu.adapter}: {len(outcome)} result(s), {len(relevant)} relevant"
+        )
 
     notes.extend(budget.notes[before:])  # only the notes this hop produced
     return {"entities": entities, "context": context, "notes": notes}

@@ -120,6 +120,17 @@ async def test_reddit_search_text_without_city_sends_bare_query(monkeypatch) -> 
     assert json.loads(route.calls.last.request.content)["searches"] == [_QUERY]
 
 
+@respx.mock
+async def test_reddit_search_text_does_not_double_prefix_city(monkeypatch) -> None:
+    import locale_agent.adapters.reddit as rmod
+
+    monkeypatch.setattr(rmod, "get_settings", lambda: Settings(apify_token="tok"))
+    route = respx.post(url__startswith=_APIFY_ENDPOINT).mock(return_value=httpx.Response(200, json=[]))
+    await RedditAdapter().search_text(f"{_QUERY} san jose reviews", _GEO, RateBudget(None, cost_cap=12))
+    # city already present (case-insensitive) → sent as-is, not "San Jose Adobe ... san jose ..."
+    assert json.loads(route.calls.last.request.content)["searches"] == [f"{_QUERY} san jose reviews"]
+
+
 async def test_reddit_search_text_noop_without_token(monkeypatch) -> None:
     import locale_agent.adapters.reddit as rmod
 

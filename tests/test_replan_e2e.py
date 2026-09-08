@@ -119,9 +119,9 @@ async def test_ask_surfaces_second_hop(offline_stack: FakeAdapter) -> None:
     # replan decision serialised on the response
     replan = data["replan"]
     assert replan["stop_reason"] == ""
-    assert [f["query"] for f in replan["follow_ups"]] == ["Adobe Animal Hospital San Jose", "Banfield San Jose"]
+    assert [f["query"] for f in replan["follow_ups"]] == ["Adobe Animal Hospital", "Banfield"]
     assert all(f["adapter"] == "fake_places" for f in replan["follow_ups"])
-    assert sorted(offline_stack.text_queries) == ["Adobe Animal Hospital San Jose", "Banfield San Jose"]
+    assert sorted(offline_stack.text_queries) == ["Adobe Animal Hospital", "Banfield"]
 
     # per-place opinions ride on the options
     opts = data["answer"]["options"]
@@ -134,7 +134,7 @@ async def test_ask_surfaces_second_hop(offline_stack: FakeAdapter) -> None:
     # notes discipline
     notes = data["notes"]
     assert "replan: 2 follow-up(s) planned via fallback" in notes
-    assert any(n.startswith("follow-up 'Adobe Animal Hospital San Jose' on fake_places: 2 result(s)") for n in notes)
+    assert "follow-up 'Adobe Animal Hospital' on fake_places: 2 result(s), 2 relevant" in notes
 
     # the answer uses the opinions and cites at least one of them
     body = data["answer"]["body"]

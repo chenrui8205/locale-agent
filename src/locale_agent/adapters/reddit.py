@@ -13,7 +13,8 @@ empty per the no-hoarding rule.
 Two entry points share one Apify call path:
   - `search(spec, geo, budget)`: first hop, query built from the QuerySpec.
   - `search_text(query, geo, budget)`: second hop (re-planning), free text such
-    as "<place name>" — the city is prefixed here so the caller doesn't have to.
+    as "<place name>" — the city is prefixed here so the caller doesn't have to
+    (and is NOT prefixed again if the query already names it).
 """
 
 from __future__ import annotations
@@ -35,6 +36,13 @@ _FOLLOWUP_LIMIT = 5  # second-hop posts per follow-up query (bounded fan-out)
 
 def _city_slug(city: str) -> str:
     return "".join(ch for ch in city.lower() if ch.isalnum())
+
+
+def _with_city(terms: str, city: str | None) -> str:
+    """Prefix the city unless the query already mentions it (case-insensitive)."""
+    if not city or city.lower() in terms.lower():
+        return terms
+    return f"{city} {terms}".strip()
 
 
 def _search_terms(spec: QuerySpec) -> str:
@@ -105,7 +113,7 @@ class RedditAdapter(SourceAdapter):
         if not await budget.allow(self.name):
             return []
 
-        query = f"{geo.city} {terms}".strip() if geo.city else terms
+        query = _with_city(terms, geo.city)
         run_input = {
             "searches": [query],
             "searchPosts": True,

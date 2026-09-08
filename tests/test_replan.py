@@ -129,7 +129,7 @@ async def test_fallback_plans_nearest_n_on_reddit(settings) -> None:  # type: ig
     assert isinstance(d, ReplanDecision) and d.stop_reason == ""
     assert [f.entity_index for f in d.follow_ups] == [1, 0, 3]
     assert all(f.adapter == "reddit" for f in d.follow_ups)
-    assert [f.query for f in d.follow_ups] == ["B San Jose", "A San Jose", "D San Jose"]
+    assert [f.query for f in d.follow_ups] == ["B", "A", "D"]  # bare names; adapter adds the city
     assert "replan: 3 follow-up(s) planned via fallback" in out["notes"]
 
 
@@ -137,7 +137,7 @@ async def test_fallback_respects_max_follow_ups_and_missing_city(settings, monke
     monkeypatch.setattr(settings, "replan_max_follow_ups", 1)
     geo = _GEO.model_copy(update={"city": ""})
     out = await replan({"entities": [_entity("A", 1), _entity("B", 2)], "geo": geo, "notes": []})
-    assert [f.query for f in out["replan"].follow_ups] == ["A"]  # no trailing space
+    assert [f.query for f in out["replan"].follow_ups] == ["A"]  # no city, no trailing space
 
 
 async def test_replan_skips_when_disabled(settings, monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -204,8 +204,82 @@ async def test_execute_follow_ups_attaches_opinions_and_dedups_context(fake_adap
     }
     assert {r.about for r in ctx[1:]} == {"Adobe Animal Hospital", "Banfield"}
     notes = out["notes"]
-    assert "follow-up 'Banfield San Jose' on fake_places: 2 result(s)" in notes
+    assert "follow-up 'Banfield San Jose' on fake_places: 2 result(s), 2 relevant" in notes
     assert any("on missing_adapter failed" in n for n in notes)
+
+
+class NoisyAdapter(FakeAdapter):
+    """Reddit-shaped: one hit about the place, two city-level noise posts."""
+
+    name = "noisy"
+
+    async def search_text(self, query: str, geo: GeoContext, budget: RateBudget) -> list[SourceResult]:
+        await budget.allow(self.name)
+        self.text_queries.append(query)
+        now = datetime.now(UTC)
+        mk = lambda i, t, s: SourceResult(source="reddit", url=f"https://reddit/noisy/{i}", title=t,  # noqa: E731
+                                          snippet=s, kind="discussion", fetched_at=now)
+        return [
+            mk(1, "World Cup 2026 San Jose viewing party", "who's going to Levi's?"),
+            mk(2, "Took my dog to Banfield's on N 1st last night", "ER was quick, pricey"),
+            mk(3, "Regional Medical Center San Jose wait times?", "spent 4h in the ER"),
+        ]
+
+
+async def test_execute_follow_ups_filters_irrelevant_results(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    noisy = NoisyAdapter()
+    adapters_base.register(noisy)
+    try:
+        ents = [_entity("Banfield Pet Hospital", 100)]
+        decision = ReplanDecision(follow_ups=[FollowUp(entity_index=0, adapter="noisy", query="Banfield Pet Hospital")])
+        out = await execute_follow_ups({
+            "entities": ents, "context": [], "geo": _GEO, "replan": decision, "notes": [],
+            "budget": RateBudget(None, cost_cap=12),
+        })
+    finally:
+        adapters_base._REGISTRY.remove(noisy)
+    (e,) = out["entities"]
+    assert [o.url for o in e.opinions] == ["https://reddit/noisy/2"]
+    assert [r.url for r in out["context"]] == ["https://reddit/noisy/2"]  # dropped hits never enter context
+    assert "follow-up 'Banfield Pet Hospital' on noisy: 3 result(s), 1 relevant" in out["notes"]
+
+
+# --------------------------------------------------------------------------- #
+# _is_about (relevance rule)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("text", "name", "expected"),
+    [
+        # distinctive token present
+        ("Took my dog to Banfield's on N 1st last night — ER was quick", "Banfield Pet Hospital", True),
+        ("Is Adobe Animal Hospital any good? great vet", "Adobe Animal Hospital", True),
+        # city-level noise: no distinctive token
+        ("World Cup 2026 San Jose viewing party — who's going?", "Banfield Pet Hospital", False),
+        ("Regional Medical Center San Jose wait times? spent 4h in the ER", "Banfield Pet Hospital", False),
+        # generic words alone never count ("pet", "hospital" appear, "banfield" does not)
+        ("best pet hospital in town?", "Banfield Pet Hospital", False),
+        # name made only of generic words: needs >= 2 of its own tokens
+        ("the pet emergency center on Saratoga was great", "Pet Emergency Center", True),
+        ("any good emergency vet?", "Pet Emergency Center", False),  # only 1 of its tokens
+        ("my pet is sick", "Pet Emergency Center", False),
+        # whole-word match, not substring
+        ("Adobe Acrobat crashed again", "Adobe Animal Hospital", True),   # same token, accepted by design
+        ("Banfields are great", "Banfield", False),
+        ("", "Banfield", False),
+        ("anything", "", False),
+    ],
+)
+def test_is_about(text: str, name: str, expected: bool) -> None:
+    assert graph_mod._is_about(text, name) is expected
+
+
+def test_is_about_treats_city_tokens_as_generic() -> None:
+    # "San Jose Animal Hospital" must not match every San Jose post once the city is generic
+    assert graph_mod._is_about("San Jose traffic is awful", "San Jose Animal Hospital") is True
+    assert graph_mod._is_about("San Jose traffic is awful", "San Jose Animal Hospital",
+                               extra_generic=frozenset({"san", "jose"})) is False
+    assert graph_mod._is_about("the animal hospital in san jose saved my cat", "San Jose Animal Hospital",
+                               extra_generic=frozenset({"san", "jose"})) is True
 
 
 async def test_execute_follow_ups_noop_without_decision() -> None:
@@ -263,9 +337,7 @@ async def test_run_agent_end_to_end_offline(fake_adapter: FakeAdapter, settings,
 
     final = await run_agent(query_id="q1", raw_query="emergency vet", address="1 Main St, San Jose, CA", spec=_SPEC)
     assert final["replan"].stop_reason == ""
-    assert [f.query for f in final["replan"].follow_ups] == [
-        "Adobe Animal Hospital San Jose", "Banfield San Jose",
-    ]
+    assert [f.query for f in final["replan"].follow_ups] == ["Adobe Animal Hospital", "Banfield"]
     ents = final["entities"]
     assert len(ents[0].opinions) == 2 and len(ents[1].opinions) == 2 and ents[2].opinions == []
     assert "replan: 2 follow-up(s) planned via fallback" in final["notes"]
