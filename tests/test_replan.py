@@ -258,10 +258,13 @@ async def test_execute_follow_ups_filters_irrelevant_results(monkeypatch) -> Non
         ("Regional Medical Center San Jose wait times? spent 4h in the ER", "Banfield Pet Hospital", False),
         # generic words alone never count ("pet", "hospital" appear, "banfield" does not)
         ("best pet hospital in town?", "Banfield Pet Hospital", False),
-        # name made only of generic words: needs >= 2 of its own tokens
+        # name made only of generic words: needs ALL of its own tokens
         ("the pet emergency center on Saratoga was great", "Pet Emergency Center", True),
         ("any good emergency vet?", "Pet Emergency Center", False),  # only 1 of its tokens
         ("my pet is sick", "Pet Emergency Center", False),
+        # live false positive 2026-09-08: the city shelter is not the clinic
+        ("URGENT - San Jose Animal Care Center new policy announced today", "Animal Health Center", False),
+        ("Animal Health Center on Story Rd stayed open late for us", "Animal Health Center", True),
         # whole-word match, not substring
         ("Adobe Acrobat crashed again", "Adobe Animal Hospital", True),   # same token, accepted by design
         ("Banfields are great", "Banfield", False),

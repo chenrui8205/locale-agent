@@ -94,7 +94,9 @@ _GENERIC_NAME_TOKENS: frozenset[str] = frozenset({
     "north", "south", "east", "west", "n", "s", "e", "w", "st", "street", "ave",
     "avenue", "rd", "road", "blvd", "boulevard", "drive", "hwy", "highway",
 })
-_MIN_GENERIC_TOKEN_MATCHES = 2  # names made only of generic words need this many hits
+# Names made only of generic words ("Animal Health Center") carry no distinctive
+# token, so every one of their own tokens must appear — otherwise "San José Animal
+# Care Center" (the city shelter) passes for "Animal Health Center". Live run 2026-09-08.
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 
@@ -109,8 +111,8 @@ def _is_about(result_text: str, entity_name: str, *, extra_generic: frozenset[st
     Tokenise the entity name (lowercase, alnum), drop generic words (and any
     caller-supplied ones, e.g. the city's tokens), and require at least one
     distinctive token to appear as a whole word in `result_text`. A name with no
-    distinctive token (e.g. "Pet Emergency Center") must match at least
-    `_MIN_GENERIC_TOKEN_MATCHES` of its own tokens instead.
+    distinctive token (e.g. "Pet Emergency Center") must match ALL of its own
+    (non-city) tokens instead.
     """
     name_tokens = _tokens(entity_name)
     if not name_tokens:
@@ -125,8 +127,7 @@ def _is_about(result_text: str, entity_name: str, *, extra_generic: frozenset[st
     countable = {t for t in name_tokens if t not in extra_generic}
     if not countable:
         return False
-    hits = sum(1 for t in countable if t in text_tokens)
-    return hits >= min(_MIN_GENERIC_TOKEN_MATCHES, len(countable))
+    return all(t in text_tokens for t in countable)
 
 
 # --------------------------------------------------------------------------- #
